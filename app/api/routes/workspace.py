@@ -5,15 +5,16 @@ from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
-from app.models.models import User
+from app.db.session import get_db
+from app.models.enums import JobStatus
+from app.models.models import GenerationJob, Project, User
 from app.services.pipeline.worker import generation_worker
-from app.services.workers.registry import job_registry
+
 
 router = APIRouter(prefix="/workspace", tags=["workspace"])
-
-PROJECTS: dict[str, dict] = {}
 
 
 class ProjectCreate(BaseModel):
@@ -31,36 +32,124 @@ class ProjectCreate(BaseModel):
     auto_publish: bool = False
 
 
-@router.post("/projects", status_code=201)
-def create_project(payload: ProjectCreate, user: User = Depends(get_current_user)):
-    project_id = str(uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-    PROJECTS[project_id] = {
-        "id": project_id,
-        "organization_id": user.organization_id,
-        **payload.model_dump(),
-        "status": "draft",
-        "created_at": now,
-        "updated_at": now,
+class GenerateRequest(BaseModel):
+    project_id: str
+
+
+def _project_response(project: Project) -> dict:
+    settings = project.settings or {}
+
+    return {
+        "id": project.id,
+        "organization_id": project.organization_id,
+        "name": project.name,
+        "category": settings.get("category", "General"),
+        "language": settings.get("language", "English"),
+        "format": settings.get("format", "short"),
+        "duration_seconds": settings.get("duration_seconds", 60),
+        "source_text": settings.get("source_text", ""),
+        "channel_ids": settings.get("channel_ids", []),
+        "video_model": settings.get("video_model", "Wan2.1 T2V 1.3B"),
+        "tts_model": settings.get("tts_model", "Qwen3-TTS 0.6B"),
+        "judge_model": settings.get("judge_model", "Local Multimodal Judge"),
+        "approval_required": settings.get("approval_required", True),
+        "auto_publish": settings.get("auto_publish", False),
+        "status": project.status,
+        "created_at": project.settings.get("_created_at") if project.settings else None,
+        "updated_at": project.settings.get("_updated_at") if project.settings else None,
     }
-    return PROJECTS[project_id]
+
+
+def _job_response(job: GenerationJob) -> dict:
+    output_data = job.output_data or {}
+
+    return {
+        "id": job.id,
+        "project_id": job.project_id,
+        "organization_id": job.organization_id,
+        "type": job.job_type,
+        "status": output_data.get("status", job.status.value),
+        "stage": output_data.get("stage", "queued"),
+        "progress": output_data.get("progress", 0),
+        "message": output_data.get("message", "Generation request accepted"),
+        "created_at": output_data.get("created_at"),
+        "updated_at": output_data.get("updated_at"),
+    }
+
+
+@router.post("/projects", status_code=201)
+def create_project(
+    payload: ProjectCreate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    now = datetime.now(timezone.utc).isoformat()
+
+    project_id = str(uuid4())
+
+    project = Project(
+        id=project_id,
+        organization_id=user.organization_id,
+        name=payload.name,
+        status="draft",
+        settings={
+            "category": payload.category,
+            "language": payload.language,
+            "format": payload.format,
+            "duration_seconds": payload.duration_seconds,
+            "source_text": payload.source_text,
+            "channel_ids": payload.channel_ids,
+            "video_model": payload.video_model,
+            "tts_model": payload.tts_model,
+            "judge_model": payload.judge_model,
+            "approval_required": payload.approval_required,
+            "auto_publish": payload.auto_publish,
+            "_created_at": now,
+            "_updated_at": now,
+        },
+    )
+
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+
+    return _project_response(project)
 
 
 @router.get("/projects")
-def list_projects(user: User = Depends(get_current_user)):
-    return [p for p in PROJECTS.values() if p["organization_id"] == user.organization_id]
+def list_projects(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    projects = (
+        db.query(Project)
+        .filter(Project.organization_id == user.organization_id)
+        .order_by(Project.name.asc())
+        .all()
+    )
+
+    return [_project_response(project) for project in projects]
 
 
 @router.get("/projects/{project_id}")
-def get_project(project_id: str, user: User = Depends(get_current_user)):
-    project = PROJECTS.get(project_id)
-    if not project or project["organization_id"] != user.organization_id:
+def get_project(
+    project_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = (
+        db.query(Project)
+        .filter(
+            Project.id == project_id,
+            Project.organization_id == user.organization_id,
+        )
+        .first()
+    )
+
+    if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    return project
 
-
-class GenerateRequest(BaseModel):
-    project_id: str
+    return _project_response(project)
 
 
 @router.post("/generate", status_code=202)
@@ -68,39 +157,91 @@ def enqueue_generation(
     payload: GenerateRequest,
     background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    project = PROJECTS.get(payload.project_id)
-    if not project or project["organization_id"] != user.organization_id:
+    project = (
+        db.query(Project)
+        .filter(
+            Project.id == payload.project_id,
+            Project.organization_id == user.organization_id,
+        )
+        .first()
+    )
+
+    if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    now = datetime.now(timezone.utc).isoformat()
     job_id = str(uuid4())
-    job = {
-        "id": job_id,
-        "project_id": project["id"],
-        "organization_id": user.organization_id,
-        "type": "content_generation",
-        "status": "queued",
-        "stage": "queued",
-        "progress": 0,
-        "message": "Generation request accepted",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    job_registry.put(job_id, job)
-    project["status"] = "queued"
-    project["updated_at"] = datetime.now(timezone.utc).isoformat()
 
+    job = GenerationJob(
+        id=job_id,
+        organization_id=user.organization_id,
+        project_id=project.id,
+        job_type="content_generation",
+        status=JobStatus.QUEUED,
+        input_data={
+            "project_id": project.id,
+            "source_text": (project.settings or {}).get("source_text", ""),
+        },
+        output_data={
+            "status": "queued",
+            "stage": "queued",
+            "progress": 0,
+            "message": "Generation request accepted",
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+
+    project.status = "queued"
+
+    settings = dict(project.settings or {})
+    settings["_updated_at"] = now
+    project.settings = settings
+
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    # The development worker is still used temporarily.
+    # Phase 65B will move worker state fully into PostgreSQL.
     background_tasks.add_task(generation_worker.run, job_id)
-    return job
+
+    return _job_response(job)
 
 
 @router.get("/jobs")
-def list_jobs(user: User = Depends(get_current_user)):
-    return job_registry.all(user.organization_id)
+def list_jobs(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    jobs = (
+        db.query(GenerationJob)
+        .filter(GenerationJob.organization_id == user.organization_id)
+        .order_by(GenerationJob.id.desc())
+        .all()
+    )
+
+    return [_job_response(job) for job in jobs]
 
 
 @router.get("/jobs/{job_id}")
-def get_job(job_id: str, user: User = Depends(get_current_user)):
-    job = job_registry.get(job_id)
-    if not job or job["organization_id"] != user.organization_id:
+def get_job(
+    job_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = (
+        db.query(GenerationJob)
+        .filter(
+            GenerationJob.id == job_id,
+            GenerationJob.organization_id == user.organization_id,
+        )
+        .first()
+    )
+
+    if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job
+
+    return _job_response(job)
