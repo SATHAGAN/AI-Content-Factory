@@ -6,6 +6,6 @@ venv/
 .env
 *.db
 *.sqlite
-artifacts/
-outputs/
+/artifacts/
+/outputs/
 .DS_Store
