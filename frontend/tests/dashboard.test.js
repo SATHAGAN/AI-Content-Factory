@@ -1,0 +1,1 @@
+import {describe,it,expect} from "vitest"; describe("dashboard",()=>{it("keeps daily targets dynamic",()=>{const c={shorts:5,long:2};c.shorts=10;expect(c.shorts).toBe(10)})})

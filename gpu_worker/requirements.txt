@@ -1,0 +1,11 @@
+torch>=2.4.0
+torchvision
+transformers
+diffusers
+accelerate
+safetensors
+huggingface_hub
+fastapi
+uvicorn[standard]
+pydantic>=2.10
+python-multipart
