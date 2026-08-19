@@ -21,6 +21,8 @@ dependencies = [
   "PyJWT>=2.10,<3",
   "argon2-cffi>=23.1,<26",
   "google-cloud-storage>=3,<4",
+  "Pillow>=11,<13",
+  "imageio-ffmpeg>=0.6,<1",
 ]
 
 [project.optional-dependencies]
