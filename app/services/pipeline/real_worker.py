@@ -112,6 +112,13 @@ class RealGenerationWorker:
                 duration_seconds=remote_result.get("duration_seconds"),
                 scene_count=len(scenes),
             )
+
+            output = dict(job.output_data or {})
+            output["status"] = "awaiting_approval"
+            output["updated_at"] = _now()
+            job.output_data = output
+            db.commit()
+            db.refresh(job)
             return dict(job.output_data or {})
         except Exception as exc:
             job = db.query(GenerationJob).filter(GenerationJob.id == job_id).first()
