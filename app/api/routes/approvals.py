@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
+
 from app.api.deps import get_current_user
 from app.db.session import get_db
 from app.models.enums import JobStatus
@@ -34,12 +37,7 @@ def _transition(job: GenerationJob, project: Project, *, status: str, message: s
     return output
 
 
-@router.post("/{job_id}/approve")
-def approve_job(
-    job_id: str,
-    user: User = Depends(get_current_user),
-    db=Depends(get_db),
-):
+def _get_job(job_id: str, user: User, db):
     job = (
         db.query(GenerationJob)
         .filter(
@@ -50,22 +48,44 @@ def approve_job(
     )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if (job.output_data or {}).get("status") != "awaiting_approval":
-        raise HTTPException(status_code=409, detail="Job is not awaiting approval")
+    return job
 
+
+def _get_project(job: GenerationJob, user: User, db):
     project = db.query(Project).filter(
         Project.id == job.project_id,
         Project.organization_id == user.organization_id,
     ).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    return project
 
-    output = _transition(
-        job, project,
-        status="approved",
-        message="Generation approved",
-        db=db,
-    )
+
+@router.get("/{job_id}/artifact")
+def get_artifact(
+    job_id: str,
+    user: User = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    job = _get_job(job_id, user, db)
+    path = Path((job.output_data or {}).get("final_video_path", "")).resolve()
+    root = Path("artifacts/jobs").resolve()
+    if root not in path.parents or not path.is_file():
+        raise HTTPException(status_code=404, detail="Generated video artifact is not available")
+    return FileResponse(path, media_type="video/mp4", filename=f"{job_id}.mp4")
+
+
+@router.post("/{job_id}/approve")
+def approve_job(
+    job_id: str,
+    user: User = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    job = _get_job(job_id, user, db)
+    if (job.output_data or {}).get("status") != "awaiting_approval":
+        raise HTTPException(status_code=409, detail="Job is not awaiting approval")
+    project = _get_project(job, user, db)
+    output = _transition(job, project, status="approved", message="Generation approved", db=db)
     return {"job_id": job.id, "status": output["status"], "message": output["message"]}
 
 
@@ -75,30 +95,9 @@ def reject_job(
     user: User = Depends(get_current_user),
     db=Depends(get_db),
 ):
-    job = (
-        db.query(GenerationJob)
-        .filter(
-            GenerationJob.id == job_id,
-            GenerationJob.organization_id == user.organization_id,
-        )
-        .first()
-    )
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = _get_job(job_id, user, db)
     if (job.output_data or {}).get("status") != "awaiting_approval":
         raise HTTPException(status_code=409, detail="Job is not awaiting approval")
-
-    project = db.query(Project).filter(
-        Project.id == job.project_id,
-        Project.organization_id == user.organization_id,
-    ).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    output = _transition(
-        job, project,
-        status="rejected",
-        message="Generation rejected",
-        db=db,
-    )
+    project = _get_project(job, user, db)
+    output = _transition(job, project, status="rejected", message="Generation rejected", db=db)
     return {"job_id": job.id, "status": output["status"], "message": output["message"]}
