@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -11,10 +12,12 @@ from app.api.deps import get_current_user
 from app.db.session import get_db
 from app.models.enums import JobStatus
 from app.models.models import GenerationJob, Project, User
+from app.services.pipeline.real_worker import real_generation_worker
 from app.services.pipeline.worker import generation_worker
 
 
 router = APIRouter(prefix="/workspace", tags=["workspace"])
+PIPELINE_MODE = os.getenv("PIPELINE_MODE", "production").lower()
 
 
 class ProjectCreate(BaseModel):
@@ -38,7 +41,6 @@ class GenerateRequest(BaseModel):
 
 def _project_response(project: Project) -> dict:
     settings = project.settings or {}
-
     return {
         "id": project.id,
         "organization_id": project.organization_id,
@@ -55,14 +57,13 @@ def _project_response(project: Project) -> dict:
         "approval_required": settings.get("approval_required", True),
         "auto_publish": settings.get("auto_publish", False),
         "status": project.status,
-        "created_at": project.settings.get("_created_at") if project.settings else None,
-        "updated_at": project.settings.get("_updated_at") if project.settings else None,
+        "created_at": settings.get("_created_at"),
+        "updated_at": settings.get("_updated_at"),
     }
 
 
 def _job_response(job: GenerationJob) -> dict:
     output_data = job.output_data or {}
-
     return {
         "id": job.id,
         "project_id": job.project_id,
@@ -74,6 +75,8 @@ def _job_response(job: GenerationJob) -> dict:
         "message": output_data.get("message", "Generation request accepted"),
         "created_at": output_data.get("created_at"),
         "updated_at": output_data.get("updated_at"),
+        "final_video_path": output_data.get("final_video_path"),
+        "model_id": output_data.get("model_id"),
     }
 
 
@@ -84,11 +87,8 @@ def create_project(
     db: Session = Depends(get_db),
 ):
     now = datetime.now(timezone.utc).isoformat()
-
-    project_id = str(uuid4())
-
     project = Project(
-        id=project_id,
+        id=str(uuid4()),
         organization_id=user.organization_id,
         name=payload.name,
         status="draft",
@@ -108,11 +108,9 @@ def create_project(
             "_updated_at": now,
         },
     )
-
     db.add(project)
     db.commit()
     db.refresh(project)
-
     return _project_response(project)
 
 
@@ -127,7 +125,6 @@ def list_projects(
         .order_by(Project.name.asc())
         .all()
     )
-
     return [_project_response(project) for project in projects]
 
 
@@ -139,16 +136,11 @@ def get_project(
 ):
     project = (
         db.query(Project)
-        .filter(
-            Project.id == project_id,
-            Project.organization_id == user.organization_id,
-        )
+        .filter(Project.id == project_id, Project.organization_id == user.organization_id)
         .first()
     )
-
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-
     return _project_response(project)
 
 
@@ -161,29 +153,20 @@ def enqueue_generation(
 ):
     project = (
         db.query(Project)
-        .filter(
-            Project.id == payload.project_id,
-            Project.organization_id == user.organization_id,
-        )
+        .filter(Project.id == payload.project_id, Project.organization_id == user.organization_id)
         .first()
     )
-
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
     now = datetime.now(timezone.utc).isoformat()
-    job_id = str(uuid4())
-
     job = GenerationJob(
-        id=job_id,
+        id=str(uuid4()),
         organization_id=user.organization_id,
         project_id=project.id,
         job_type="content_generation",
         status=JobStatus.QUEUED,
-        input_data={
-            "project_id": project.id,
-            "source_text": (project.settings or {}).get("source_text", ""),
-        },
+        input_data={"project_id": project.id, "source_text": (project.settings or {}).get("source_text", "")},
         output_data={
             "status": "queued",
             "stage": "queued",
@@ -193,20 +176,18 @@ def enqueue_generation(
             "updated_at": now,
         },
     )
-
     project.status = "queued"
-
     settings = dict(project.settings or {})
     settings["_updated_at"] = now
     project.settings = settings
-
     db.add(job)
     db.commit()
     db.refresh(job)
 
-    # The development worker is still used temporarily.
-    # Phase 65B will move worker state fully into PostgreSQL.
-    background_tasks.add_task(generation_worker.run, job_id)
+    if PIPELINE_MODE == "development":
+        background_tasks.add_task(generation_worker.run, job.id)
+    else:
+        background_tasks.add_task(real_generation_worker.run, job.id)
 
     return _job_response(job)
 
@@ -222,7 +203,6 @@ def list_jobs(
         .order_by(GenerationJob.id.desc())
         .all()
     )
-
     return [_job_response(job) for job in jobs]
 
 
@@ -234,14 +214,9 @@ def get_job(
 ):
     job = (
         db.query(GenerationJob)
-        .filter(
-            GenerationJob.id == job_id,
-            GenerationJob.organization_id == user.organization_id,
-        )
+        .filter(GenerationJob.id == job_id, GenerationJob.organization_id == user.organization_id)
         .first()
     )
-
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
     return _job_response(job)
