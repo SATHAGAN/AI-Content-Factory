@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -11,10 +14,13 @@ from app.api.deps import get_current_user
 from app.db.session import get_db
 from app.models.enums import JobStatus
 from app.models.models import GenerationJob, Project, User
+from app.services.pipeline.demo_worker import demo_generation_worker
+from app.services.pipeline.real_worker import real_generation_worker
 from app.services.pipeline.worker import generation_worker
 
 
 router = APIRouter(prefix="/workspace", tags=["workspace"])
+PIPELINE_MODE = os.getenv("PIPELINE_MODE", "demo").lower()
 
 
 class ProjectCreate(BaseModel):
@@ -36,9 +42,12 @@ class GenerateRequest(BaseModel):
     project_id: str
 
 
+class ApprovalRequest(BaseModel):
+    comment: str | None = Field(default=None, max_length=2000)
+
+
 def _project_response(project: Project) -> dict:
     settings = project.settings or {}
-
     return {
         "id": project.id,
         "organization_id": project.organization_id,
@@ -55,14 +64,14 @@ def _project_response(project: Project) -> dict:
         "approval_required": settings.get("approval_required", True),
         "auto_publish": settings.get("auto_publish", False),
         "status": project.status,
-        "created_at": project.settings.get("_created_at") if project.settings else None,
-        "updated_at": project.settings.get("_updated_at") if project.settings else None,
+        "created_at": settings.get("_created_at"),
+        "updated_at": settings.get("_updated_at"),
     }
 
 
 def _job_response(job: GenerationJob) -> dict:
     output_data = job.output_data or {}
-
+    artifact_path = output_data.get("final_video_path")
     return {
         "id": job.id,
         "project_id": job.project_id,
@@ -74,82 +83,68 @@ def _job_response(job: GenerationJob) -> dict:
         "message": output_data.get("message", "Generation request accepted"),
         "created_at": output_data.get("created_at"),
         "updated_at": output_data.get("updated_at"),
+        "final_video_path": artifact_path,
+        "artifact_url": f"/api/v1/workspace/jobs/{job.id}/artifact" if artifact_path else None,
+        "model_id": output_data.get("model_id"),
+        "scene_count": output_data.get("scene_count"),
+        "duration_seconds": output_data.get("duration_seconds"),
+        "approval_comment": output_data.get("approval_comment"),
+        "demo": output_data.get("demo", False),
+        "quality_note": output_data.get("quality_note"),
     }
 
 
+def _get_project(db: Session, user: User, project_id: str) -> Project:
+    project = (
+        db.query(Project)
+        .filter(Project.id == project_id, Project.organization_id == user.organization_id)
+        .first()
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+def _get_job(db: Session, user: User, job_id: str) -> GenerationJob:
+    job = (
+        db.query(GenerationJob)
+        .filter(GenerationJob.id == job_id, GenerationJob.organization_id == user.organization_id)
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
 @router.post("/projects", status_code=201)
-def create_project(
-    payload: ProjectCreate,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def create_project(payload: ProjectCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     now = datetime.now(timezone.utc).isoformat()
-
-    project_id = str(uuid4())
-
     project = Project(
-        id=project_id,
-        organization_id=user.organization_id,
-        name=payload.name,
-        status="draft",
+        id=str(uuid4()), organization_id=user.organization_id, name=payload.name, status="draft",
         settings={
-            "category": payload.category,
-            "language": payload.language,
-            "format": payload.format,
-            "duration_seconds": payload.duration_seconds,
-            "source_text": payload.source_text,
-            "channel_ids": payload.channel_ids,
-            "video_model": payload.video_model,
-            "tts_model": payload.tts_model,
-            "judge_model": payload.judge_model,
-            "approval_required": payload.approval_required,
-            "auto_publish": payload.auto_publish,
-            "_created_at": now,
-            "_updated_at": now,
+            "category": payload.category, "language": payload.language, "format": payload.format,
+            "duration_seconds": payload.duration_seconds, "source_text": payload.source_text,
+            "channel_ids": payload.channel_ids, "video_model": payload.video_model,
+            "tts_model": payload.tts_model, "judge_model": payload.judge_model,
+            "approval_required": payload.approval_required, "auto_publish": payload.auto_publish,
+            "_created_at": now, "_updated_at": now,
         },
     )
-
     db.add(project)
     db.commit()
     db.refresh(project)
-
     return _project_response(project)
 
 
 @router.get("/projects")
-def list_projects(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    projects = (
-        db.query(Project)
-        .filter(Project.organization_id == user.organization_id)
-        .order_by(Project.name.asc())
-        .all()
-    )
-
+def list_projects(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    projects = db.query(Project).filter(Project.organization_id == user.organization_id).order_by(Project.name.asc()).all()
     return [_project_response(project) for project in projects]
 
 
 @router.get("/projects/{project_id}")
-def get_project(
-    project_id: str,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    project = (
-        db.query(Project)
-        .filter(
-            Project.id == project_id,
-            Project.organization_id == user.organization_id,
-        )
-        .first()
-    )
-
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    return _project_response(project)
+def get_project(project_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return _project_response(_get_project(db, user, project_id))
 
 
 @router.post("/generate", status_code=202)
@@ -159,89 +154,86 @@ def enqueue_generation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    project = (
-        db.query(Project)
-        .filter(
-            Project.id == payload.project_id,
-            Project.organization_id == user.organization_id,
-        )
-        .first()
-    )
-
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
+    project = _get_project(db, user, payload.project_id)
     now = datetime.now(timezone.utc).isoformat()
-    job_id = str(uuid4())
-
     job = GenerationJob(
-        id=job_id,
-        organization_id=user.organization_id,
-        project_id=project.id,
-        job_type="content_generation",
-        status=JobStatus.QUEUED,
-        input_data={
-            "project_id": project.id,
-            "source_text": (project.settings or {}).get("source_text", ""),
-        },
-        output_data={
-            "status": "queued",
-            "stage": "queued",
-            "progress": 0,
-            "message": "Generation request accepted",
-            "created_at": now,
-            "updated_at": now,
-        },
+        id=str(uuid4()), organization_id=user.organization_id, project_id=project.id,
+        job_type="content_generation", status=JobStatus.QUEUED,
+        input_data={"project_id": project.id, "source_text": (project.settings or {}).get("source_text", "")},
+        output_data={"status": "queued", "stage": "queued", "progress": 0,
+                     "message": "Generation request accepted", "created_at": now, "updated_at": now},
     )
-
     project.status = "queued"
-
     settings = dict(project.settings or {})
     settings["_updated_at"] = now
     project.settings = settings
-
     db.add(job)
     db.commit()
     db.refresh(job)
 
-    # The development worker is still used temporarily.
-    # Phase 65B will move worker state fully into PostgreSQL.
-    background_tasks.add_task(generation_worker.run, job_id)
-
+    if PIPELINE_MODE == "development":
+        background_tasks.add_task(generation_worker.run, job.id)
+    elif PIPELINE_MODE == "production":
+        background_tasks.add_task(real_generation_worker.run, job.id)
+    else:
+        background_tasks.add_task(demo_generation_worker.run, job.id)
     return _job_response(job)
 
 
 @router.get("/jobs")
-def list_jobs(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    jobs = (
-        db.query(GenerationJob)
-        .filter(GenerationJob.organization_id == user.organization_id)
-        .order_by(GenerationJob.id.desc())
-        .all()
-    )
-
+def list_jobs(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    jobs = db.query(GenerationJob).filter(GenerationJob.organization_id == user.organization_id).order_by(GenerationJob.id.desc()).all()
     return [_job_response(job) for job in jobs]
 
 
 @router.get("/jobs/{job_id}")
-def get_job(
-    job_id: str,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    job = (
-        db.query(GenerationJob)
-        .filter(
-            GenerationJob.id == job_id,
-            GenerationJob.organization_id == user.organization_id,
-        )
-        .first()
-    )
+def get_job(job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return _job_response(_get_job(db, user, job_id))
 
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
 
+@router.get("/jobs/{job_id}/artifact")
+def get_artifact(job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    job = _get_job(db, user, job_id)
+    path = (job.output_data or {}).get("final_video_path")
+    if not path:
+        raise HTTPException(status_code=404, detail="Video artifact is not ready")
+    requested = Path(path).resolve()
+    root = Path(os.getenv("ARTIFACT_ROOT", "artifacts/jobs")).resolve()
+    if root not in requested.parents or not requested.is_file():
+        raise HTTPException(status_code=404, detail="Video artifact not found")
+    return FileResponse(requested, media_type="video/mp4", filename=f"{job_id}.mp4")
+
+
+@router.post("/jobs/{job_id}/approve")
+def approve_job(payload: ApprovalRequest, job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    job = _get_job(db, user, job_id)
+    output = dict(job.output_data or {})
+    if output.get("stage") != "approval":
+        raise HTTPException(status_code=409, detail="Job is not awaiting approval")
+    output["status"] = "approved"
+    output["stage"] = "approved"
+    output["progress"] = 100
+    output["approval_comment"] = payload.comment
+    output["approved_at"] = datetime.now(timezone.utc).isoformat()
+    job.output_data = output
+    job.status = JobStatus.SUCCEEDED
+    db.commit()
+    db.refresh(job)
+    return _job_response(job)
+
+
+@router.post("/jobs/{job_id}/reject")
+def reject_job(payload: ApprovalRequest, job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    job = _get_job(db, user, job_id)
+    output = dict(job.output_data or {})
+    if output.get("stage") != "approval":
+        raise HTTPException(status_code=409, detail="Job is not awaiting approval")
+    output["status"] = "rejected"
+    output["stage"] = "rejected"
+    output["approval_comment"] = payload.comment
+    output["rejected_at"] = datetime.now(timezone.utc).isoformat()
+    job.output_data = output
+    job.status = JobStatus.CANCELLED
+    db.commit()
+    db.refresh(job)
     return _job_response(job)

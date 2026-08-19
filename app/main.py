@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import (
     artifacts, auth, channels, content, content_profiles, generation,
     health, jobs, judge, projects, qa, render, sources, publishing,
-    scheduling, workspace, content_planning,
+    scheduling, workspace, content_planning, approvals,
 )
 
 app=FastAPI(title="AI Content Factory API",version="1.5.0")
@@ -19,6 +19,6 @@ for router in [
     auth.router,channels.router,content_profiles.router,sources.router,
     projects.router,content.router,jobs.router,generation.router,
     artifacts.router,render.router,qa.router,judge.router,publishing.router,
-    scheduling.router,workspace.router,content_planning.router
+    scheduling.router,workspace.router,content_planning.router,approvals.router
 ]:
     app.include_router(router,prefix="/api/v1")

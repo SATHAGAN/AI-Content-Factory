@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import time
 from datetime import datetime, timezone
 
+from app.db.session import SessionLocal
+from app.models.enums import JobStatus
+from app.models.models import GenerationJob
 from app.services.pipeline.state import PipelineStage
-from app.services.workers.registry import job_registry
 
 
 STAGES = [
@@ -18,49 +19,75 @@ STAGES = [
 ]
 
 
-class GenerationWorker:
-    """Deterministic development worker.
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    Phase 13 validates orchestration and state transitions. The actual GPU
-    providers are injected in later phases.
+
+class GenerationWorker:
+    """Development worker with durable PostgreSQL job state.
+
+    This worker intentionally keeps the deterministic development stages until
+    the real GPU-backed production orchestrator is enabled. Unlike the former
+    in-process registry, every transition is now persisted in GenerationJob.
     """
 
-    def run(self, job_id: str, delay_seconds: float = 0.0) -> dict:
-        job = job_registry.get(job_id)
-        if not job:
-            raise KeyError(job_id)
+    def _update(self, db, job: GenerationJob, *, status: JobStatus, stage: str,
+                progress: int, message: str) -> None:
+        output = dict(job.output_data or {})
+        output.update({
+            "status": status.value,
+            "stage": stage,
+            "progress": progress,
+            "message": message,
+            "updated_at": _now(),
+        })
+        job.status = status
+        job.output_data = output
+        db.commit()
+        db.refresh(job)
 
+    def run(self, job_id: str, delay_seconds: float = 0.0) -> dict:
+        del delay_seconds  # kept for backwards-compatible call signatures
+
+        db = SessionLocal()
         try:
+            job = db.query(GenerationJob).filter(GenerationJob.id == job_id).first()
+            if not job:
+                raise KeyError(job_id)
+
             for stage, progress, message in STAGES:
-                job_registry.update(
-                    job_id,
-                    status="running",
+                self._update(
+                    db,
+                    job,
+                    status=JobStatus.RUNNING,
                     stage=stage.value,
                     progress=progress,
                     message=message,
-                    updated_at=datetime.now(timezone.utc).isoformat(),
                 )
-                if delay_seconds:
-                    time.sleep(delay_seconds)
 
-            job_registry.update(
-                job_id,
-                status="awaiting_approval",
+            self._update(
+                db,
+                job,
+                status=JobStatus.SUCCEEDED,
                 stage=PipelineStage.APPROVAL.value,
                 progress=100,
                 message="Generation complete; awaiting approval",
-                updated_at=datetime.now(timezone.utc).isoformat(),
             )
-            return job_registry.get(job_id) or {}
+            return dict(job.output_data or {})
         except Exception as exc:
-            job_registry.update(
-                job_id,
-                status="failed",
-                stage=PipelineStage.FAILED.value,
-                message=str(exc),
-                updated_at=datetime.now(timezone.utc).isoformat(),
-            )
+            job = db.query(GenerationJob).filter(GenerationJob.id == job_id).first()
+            if job:
+                self._update(
+                    db,
+                    job,
+                    status=JobStatus.FAILED,
+                    stage=PipelineStage.FAILED.value,
+                    progress=int((job.output_data or {}).get("progress", 0)),
+                    message=str(exc),
+                )
             raise
+        finally:
+            db.close()
 
 
 generation_worker = GenerationWorker()
