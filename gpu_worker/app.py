@@ -10,7 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="AI Content Factory GPU Worker", version="1.0.0")
+app = FastAPI(title="AI Content Factory GPU Worker", version="1.0.1")
 
 MODEL_ID = os.getenv("VIDEO_MODEL_ID", "Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
 DEVICE = os.getenv("VIDEO_DEVICE", "cuda")
@@ -143,6 +143,12 @@ def _write_srt(scenes: list[SceneInput], path: Path) -> None:
             ])
         current += scene.duration_seconds
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+@app.get("/ping")
+def ping():
+    """RunPod load-balancer health check endpoint."""
+    return {"status": "healthy"}
 
 
 @app.get("/health")
