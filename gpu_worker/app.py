@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import gc
 import os
 import secrets
 import subprocess
-import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -172,15 +172,19 @@ def generate_video(request: VideoRequest, x_worker_token: str | None = Header(de
         clips: list[Path] = []
         for scene in request.scenes:
             raw_path = job_dir / f"{scene.scene_id}_raw.mp4"
-            final_scene_path = job_dir / f"{scene.scene_id}.mp4"
             _generate_scene(pipe, scene, raw_path)
-            if ENABLE_TTS:
-                # Load TTS only after video generation so the GPU is not holding
-                # both large model stacks at the same time.
-                pass
             clips.append(raw_path)
 
-        tts_model = None
+        if ENABLE_TTS:
+            del pipe
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
         if ENABLE_TTS:
             try:
                 import torch
