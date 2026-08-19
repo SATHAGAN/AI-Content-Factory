@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -12,12 +14,13 @@ from app.api.deps import get_current_user
 from app.db.session import get_db
 from app.models.enums import JobStatus
 from app.models.models import GenerationJob, Project, User
+from app.services.pipeline.demo_worker import demo_generation_worker
 from app.services.pipeline.real_worker import real_generation_worker
 from app.services.pipeline.worker import generation_worker
 
 
 router = APIRouter(prefix="/workspace", tags=["workspace"])
-PIPELINE_MODE = os.getenv("PIPELINE_MODE", "production").lower()
+PIPELINE_MODE = os.getenv("PIPELINE_MODE", "demo").lower()
 
 
 class ProjectCreate(BaseModel):
@@ -37,6 +40,10 @@ class ProjectCreate(BaseModel):
 
 class GenerateRequest(BaseModel):
     project_id: str
+
+
+class ApprovalRequest(BaseModel):
+    comment: str | None = Field(default=None, max_length=2000)
 
 
 def _project_response(project: Project) -> dict:
@@ -82,6 +89,8 @@ def _job_response(job: GenerationJob) -> dict:
         "scene_count": output_data.get("scene_count"),
         "duration_seconds": output_data.get("duration_seconds"),
         "approval_comment": output_data.get("approval_comment"),
+        "demo": output_data.get("demo", False),
+        "quality_note": output_data.get("quality_note"),
     }
 
 
@@ -94,6 +103,17 @@ def _get_project(db: Session, user: User, project_id: str) -> Project:
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
+
+
+def _get_job(db: Session, user: User, job_id: str) -> GenerationJob:
+    job = (
+        db.query(GenerationJob)
+        .filter(GenerationJob.id == job_id, GenerationJob.organization_id == user.organization_id)
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 @router.post("/projects", status_code=201)
@@ -153,8 +173,10 @@ def enqueue_generation(
 
     if PIPELINE_MODE == "development":
         background_tasks.add_task(generation_worker.run, job.id)
-    else:
+    elif PIPELINE_MODE == "production":
         background_tasks.add_task(real_generation_worker.run, job.id)
+    else:
+        background_tasks.add_task(demo_generation_worker.run, job.id)
     return _job_response(job)
 
 
@@ -166,9 +188,52 @@ def list_jobs(user: User = Depends(get_current_user), db: Session = Depends(get_
 
 @router.get("/jobs/{job_id}")
 def get_job(job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    job = db.query(GenerationJob).filter(
-        GenerationJob.id == job_id, GenerationJob.organization_id == user.organization_id
-    ).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    return _job_response(_get_job(db, user, job_id))
+
+
+@router.get("/jobs/{job_id}/artifact")
+def get_artifact(job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    job = _get_job(db, user, job_id)
+    path = (job.output_data or {}).get("final_video_path")
+    if not path:
+        raise HTTPException(status_code=404, detail="Video artifact is not ready")
+    requested = Path(path).resolve()
+    root = Path(os.getenv("ARTIFACT_ROOT", "artifacts/jobs")).resolve()
+    if root not in requested.parents or not requested.is_file():
+        raise HTTPException(status_code=404, detail="Video artifact not found")
+    return FileResponse(requested, media_type="video/mp4", filename=f"{job_id}.mp4")
+
+
+@router.post("/jobs/{job_id}/approve")
+def approve_job(payload: ApprovalRequest, job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    job = _get_job(db, user, job_id)
+    output = dict(job.output_data or {})
+    if output.get("stage") != "approval":
+        raise HTTPException(status_code=409, detail="Job is not awaiting approval")
+    output["status"] = "approved"
+    output["stage"] = "approved"
+    output["progress"] = 100
+    output["approval_comment"] = payload.comment
+    output["approved_at"] = datetime.now(timezone.utc).isoformat()
+    job.output_data = output
+    job.status = JobStatus.SUCCEEDED
+    db.commit()
+    db.refresh(job)
+    return _job_response(job)
+
+
+@router.post("/jobs/{job_id}/reject")
+def reject_job(payload: ApprovalRequest, job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    job = _get_job(db, user, job_id)
+    output = dict(job.output_data or {})
+    if output.get("stage") != "approval":
+        raise HTTPException(status_code=409, detail="Job is not awaiting approval")
+    output["status"] = "rejected"
+    output["stage"] = "rejected"
+    output["approval_comment"] = payload.comment
+    output["rejected_at"] = datetime.now(timezone.utc).isoformat()
+    job.output_data = output
+    job.status = JobStatus.CANCELLED
+    db.commit()
+    db.refresh(job)
     return _job_response(job)
